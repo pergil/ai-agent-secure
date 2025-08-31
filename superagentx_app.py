@@ -5,12 +5,10 @@ from pydantic import BaseModel, EmailStr
 from datetime import datetime, timedelta
 import os
 import asyncio
+import aiohttp
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from superagentx.agent import Agent
-from superagentx.llm import LLMClient
-from superagentx.prompt import PromptTemplate
 from typing import Optional, List
 import json
 import re
@@ -18,29 +16,22 @@ from email_validator import validate_email, EmailNotValidError
 
 app = FastAPI(title="SuperAgentX AI API", version="2.1.0")
 
-# ==================== KONFIGURACE Z ENVIRONMENT VARIABLES ====================
+# ==================== KONFIGURACE ====================
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
 SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
 API_MASTER_TOKEN = os.environ.get("API_MASTER_TOKEN", "tomas-hulman-ai-agents-790912")
-SMTP_SERVER = os.environ.get("SMTP_SERVER", "smtp.hostinger.com")
-SMTP_PORT = int(os.environ.get("SMTP_PORT", "465"))
-SMTP_USERNAME = os.environ.get("SMTP_USERNAME", "info@byte-wings.com")
-SMTP_FROM_EMAIL = os.environ.get("SMTP_FROM_EMAIL", "ai-agent@byte-wings.com")
 
-# BEZPEČNOSTNÍ KONTROLY
-if not DEEPSEEK_API_KEY:
-    raise ValueError("❌ CRITICAL: DEEPSEEK_API_KEY environment variable is not set!")
-
-if "your_deepseek_api_key_here" in DEEPSEEK_API_KEY:
-    raise ValueError("❌ CRITICAL: Please set a real DeepSeek API key!")
+# Kontrola API klíče
+if not DEEPSEEK_API_KEY or DEEPSEEK_API_KEY == "your_deepseek_api_key_here":
+    raise ValueError("❌ CRITICAL: Please set DEEPSEEK_API_KEY environment variable!")
 
 # SMTP KONFIGURACE
 SMTP_CONFIG = {
-    "server": SMTP_SERVER,
-    "port": SMTP_PORT,
-    "username": SMTP_USERNAME,
+    "server": "smtp.hostinger.com",
+    "port": 465,
+    "username": "info@byte-wings.com",
     "password": SMTP_PASSWORD,
-    "from_email": SMTP_FROM_EMAIL
+    "from_email": "ai-agent@byte-wings.com"
 }
 
 # Povolení CORS
@@ -52,29 +43,43 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Inicializace SuperAgentX
-os.environ['DEEPSEEK_API_KEY'] = DEEPSEEK_API_KEY
+# ==================== DEEPSEEK CLIENT ====================
+class DeepSeekClient:
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.base_url = "https://api.deepseek.com/v1/chat/completions"
+    
+    async def execute(self, query_instruction: str, additional_params: dict = None) -> str:
+        if additional_params is None:
+            additional_params = {}
+        
+        max_tokens = additional_params.get('max_tokens', 800)
+        temperature = additional_params.get('temperature', 0.7)
+        
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+        
+        data = {
+            "model": "deepseek-chat",
+            "messages": [{"role": "user", "content": query_instruction}],
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "stream": False
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.post(self.base_url, headers=headers, json=data) as response:
+                if response.status == 200:
+                    result = await response.json()
+                    return result["choices"][0]["message"]["content"]
+                else:
+                    error_text = await response.text()
+                    raise Exception(f"DeepSeek API Error {response.status}: {error_text}")
 
-llm_config = {
-    'llm_type': 'deepseek',
-    'model': 'deepseek-chat'
-}
-llm_client = LLMClient(llm_config=llm_config)
-prompt_template = PromptTemplate()
-
-# Vytvoření hlavního agenta
-main_agent = Agent(
-    name='AI_Assistant_Pro',
-    goal='Handle complex AI tasks including planning, emailing, and deep thinking',
-    role='You are a professional AI assistant with capabilities for task planning, email communication, and deep analytical thinking',
-    llm=llm_client,
-    prompt_template=prompt_template
-)
-
-# ... ZBYTEK KÓDU ZŮSTÁVÁ STEJNÝ JAKO V PŘEDCHOZÍ VERZI ...
-# (vše od modely až po konec souboru)
-
-)
+# Inicializace
+deepseek_client = DeepSeekClient(DEEPSEEK_API_KEY)
 
 # ==================== MODELY ====================
 class ChatRequest(BaseModel):
@@ -94,23 +99,18 @@ class EmailRequest(BaseModel):
     body: str
     token: str
 
-class AuthRequest(BaseModel):
-    token: str
-
 # ==================== MIDDLEWARE PRO AUTENTIZACI ====================
 @app.middleware("http")
 async def authenticate_request(request: Request, call_next):
     if request.method == "OPTIONS":
         return await call_next(request)
     
-    # Kontrola autorizace
     auth_header = request.headers.get("Authorization")
     if auth_header and auth_header.startswith("Bearer "):
         token = auth_header[7:]
         if token == API_MASTER_TOKEN:
             return await call_next(request)
     
-    # Kontrola v těle requestu pro POST
     try:
         if request.method == "POST":
             body = await request.body()
@@ -121,10 +121,7 @@ async def authenticate_request(request: Request, call_next):
     except:
         pass
     
-    return JSONResponse(
-        status_code=401,
-        content={"error": "Unauthorized - invalid token", "code": "INVALID_TOKEN"}
-    )
+    return JSONResponse(status_code=401, content={"error": "Unauthorized - invalid token"})
 
 # ==================== SMTP SLUŽBA ====================
 class SMTPService:
@@ -138,7 +135,6 @@ class SMTPService:
             return False
         
         try:
-            # Validace emailové adresy
             if not self.is_valid_email(to):
                 print(f"❌ Neplatná emailová adresa: {to}")
                 return False
@@ -148,41 +144,20 @@ class SMTPService:
             msg['To'] = to
             msg['Subject'] = subject
             
-            # HTML formátování
             html_body = f"""
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <meta charset="UTF-8">
-                <style>
-                    body {{ font-family: Arial, sans-serif; line-height: 1.6; color: #333; }}
-                    .container {{ max-width: 600px; margin: 0 auto; padding: 20px; }}
-                    .header {{ background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
-                              color: white; padding: 20px; text-align: center; border-radius: 10px 10px 0 0; }}
-                    .content {{ background: #f9f9f9; padding: 20px; border-radius: 0 0 10px 10px; }}
-                    .footer {{ text-align: center; margin-top: 20px; color: #666; font-size: 12px; }}
-                </style>
-            </head>
-            <body>
-                <div class="container">
-                    <div class="header">
-                        <h2>🤖 AI Agent Notification</h2>
-                    </div>
-                    <div class="content">
-                        {body.replace('\n', '<br>')}
-                    </div>
-                    <div class="footer">
-                        Tento email byl vygenerován automaticky AI agentem<br>
-                        {datetime.now().strftime('%d.%m.%Y %H:%M')}
-                    </div>
-                </div>
-            </body>
-            </html>
+            <!DOCTYPE html><html><head><meta charset="UTF-8"><style>
+            body {{ font-family: Arial, sans-serif; line-height: 1.6; color: #333; }}
+            .container {{ max-width: 600px; margin: 0 auto; padding: 20px; }}
+            .header {{ background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 20px; text-align: center; border-radius: 10px 10px 0 0; }}
+            .content {{ background: #f9f9f9; padding: 20px; border-radius: 0 0 10px 10px; }}
+            .footer {{ text-align: center; margin-top: 20px; color: #666; font-size: 12px; }}</style></head>
+            <body><div class="container"><div class="header"><h2>🤖 AI Agent Notification</h2></div>
+            <div class="content">{body.replace('\n', '<br>')}</div>
+            <div class="footer">Tento email byl vygenerován automaticky AI agentem<br>{datetime.now().strftime('%d.%m.%Y %H:%M')}</div></div></body></html>
             """
             
             msg.attach(MIMEText(html_body, 'html'))
             
-            # Použití SSL pro port 465
             with smtplib.SMTP_SSL(self.config['server'], self.config['port']) as server:
                 server.login(self.config['username'], self.config['password'])
                 server.send_message(msg)
@@ -211,28 +186,17 @@ class TaskScheduler:
     async def schedule_task(self, task_description: str, schedule_time: str, priority: str = "medium"):
         task_id = f"task_{len(self.scheduled_tasks) + 1}_{datetime.now().strftime('%H%M%S')}"
         task = {
-            'id': task_id,
-            'description': task_description,
-            'scheduled_time': schedule_time,
-            'priority': priority,
-            'status': 'scheduled',
-            'created_at': datetime.now().isoformat(),
+            'id': task_id, 'description': task_description, 'scheduled_time': schedule_time,
+            'priority': priority, 'status': 'scheduled', 'created_at': datetime.now().isoformat(),
             'created_at_readable': datetime.now().strftime('%d.%m.%Y %H:%M')
         }
-        
         self.scheduled_tasks.append(task)
-        
-        print(f"✅ Úkol naplánován: {task_description} na {schedule_time} (ID: {task_id})")
-        
+        print(f"✅ Úkol naplánován: {task_description} na {schedule_time}")
         return task_id
     
     async def get_scheduled_tasks(self):
-        # Odstranění starých úkolů (starší než 7 dní)
         now = datetime.now()
-        self.scheduled_tasks = [
-            task for task in self.scheduled_tasks
-            if (now - datetime.fromisoformat(task['created_at'].replace('Z', '+00:00'))).days < 7
-        ]
+        self.scheduled_tasks = [task for task in self.scheduled_tasks if (now - datetime.fromisoformat(task['created_at'].replace('Z', '+00:00'))).days < 7]
         return self.scheduled_tasks
     
     async def complete_task(self, task_id: str):
@@ -241,7 +205,7 @@ class TaskScheduler:
                 task['status'] = 'completed'
                 task['completed_at'] = datetime.now().isoformat()
                 task['completed_at_readable'] = datetime.now().strftime('%d.%m.%Y %H:%M')
-                print(f"✅ Úkol dokončen: {task['description']} (ID: {task_id})")
+                print(f"✅ Úkol dokončen: {task['description']}")
                 return True
         return False
 
@@ -253,7 +217,6 @@ async def chat_with_ai(request: ChatRequest):
     try:
         print(f"💬 Chat request: {request.message[:50]}... | Mode: {request.mode}")
         
-        # Nastavení parametrů podle režimu
         additional_params = {}
         if request.mode == "deep":
             additional_params = {"max_tokens": 2000, "temperature": 0.3}
@@ -262,13 +225,11 @@ async def chat_with_ai(request: ChatRequest):
             additional_params = {"max_tokens": 800, "temperature": 0.7}
             print("⚡ Fast mode activated")
         
-        # Zpracování zprávy pomocí SuperAgentX
-        response = await main_agent.execute(
+        response = await deepseek_client.execute(
             query_instruction=request.message,
             additional_params=additional_params
         )
         
-        # Automatická detekce speciálních příkazů
         processed_response = await process_special_commands(request.message, response)
         
         return {
@@ -287,21 +248,15 @@ async def schedule_task(request: TaskRequest):
     try:
         print(f"📅 Scheduling task: {request.task} for {request.schedule_time}")
         
-        # Použij AI pro optimalizaci popisu úkolu
-        optimized_task = await main_agent.execute(
+        optimized_task = await deepseek_client.execute(
             query_instruction=f"Optimalizuj a uprav tento úkol pro lepší provedení: {request.task}",
             additional_params={"max_tokens": 300}
         )
         
-        task_id = await task_scheduler.schedule_task(
-            optimized_task, 
-            request.schedule_time, 
-            request.priority
-        )
+        task_id = await task_scheduler.schedule_task(optimized_task, request.schedule_time, request.priority)
         
-        # Vytvoř potvrzovací zprávu
-        confirmation = await main_agent.execute(
-            query_instruction=f"Vytvoř přátelské potvrzení naplánování úkolu: {optimized_task} na čas: {request.schedule_time}",
+        confirmation = await deepseek_client.execute(
+                        query_instruction=f"Vytvoř přátelské potvrzení naplánování úkolu: {optimized_task} na čas: {request.schedule_time}",
             additional_params={"max_tokens": 150}
         )
         
@@ -325,13 +280,11 @@ async def send_email_api(request: EmailRequest):
         if not smtp_service.enabled:
             raise HTTPException(status_code=503, detail="Email service is not configured")
         
-        # Použij AI pro vylepšení emailu
-        enhanced_email = await main_agent.execute(
+        enhanced_email = await deepseek_client.execute(
             query_instruction=f"Vylepši tento email (předmět: {request.subject}): {request.body}",
             additional_params={"max_tokens": 500}
         )
         
-        # Odeslání emailu
         success = smtp_service.send_email(request.to, request.subject, enhanced_email)
         
         if success:
@@ -434,7 +387,7 @@ async def process_special_commands(user_message: str, ai_response: str) -> str:
         if match:
             email = match.group(2).strip()
             subject = match.group(4).strip()
-                        content = match.group(6).strip()
+            content = match.group(6).strip()
             
             # Ověření emailové adresy
             if smtp_service.is_valid_email(email):
@@ -507,4 +460,3 @@ if __name__ == "__main__":
     import uvicorn
     print("🔧 Running in development mode...")
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
