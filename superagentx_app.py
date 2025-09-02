@@ -19,7 +19,7 @@ app = FastAPI(title="SuperAgentX AI API", version="2.1.0")
 # ==================== KONFIGURACE ====================
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
 SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
-API_MASTER_TOKEN = os.environ.get("API_MASTER_TOKEN", "tomas-hulman-ai-agents-790912")
+API_MASTER_TOKEN = os.environ.get("API_MASTER_TOKEN", "7909127138")  # ZMĚNA: Použij tvůj token
 
 # Kontrola API klíče
 if not DEEPSEEK_API_KEY or DEEPSEEK_API_KEY == "your_deepseek_api_key_here":
@@ -102,26 +102,55 @@ class EmailRequest(BaseModel):
 # ==================== MIDDLEWARE PRO AUTENTIZACI ====================
 @app.middleware("http")
 async def authenticate_request(request: Request, call_next):
+    # Seznam veřejných endpointů které NEPOTŘEBUJÍ token
+    public_endpoints = [
+        "/api/health",
+        "/",
+        "/docs", 
+        "/redoc",
+        "/openapi.json",
+        "/favicon.ico"
+    ]
+    
+    # Pokud je to veřejný endpoint, přeskoč autentizaci
+    if request.url.path in public_endpoints:
+        return await call_next(request)
+    
+    # OPTIONS requesty pro CORS také přeskoč
     if request.method == "OPTIONS":
         return await call_next(request)
     
+    # Zkus získat token z různých zdrojů
+    token = None
+    
+    # 1. Z Authorization headeru
     auth_header = request.headers.get("Authorization")
     if auth_header and auth_header.startswith("Bearer "):
         token = auth_header[7:]
-        if token == API_MASTER_TOKEN:
-            return await call_next(request)
     
-    try:
-        if request.method == "POST":
+    # 2. Z query parametrů (pro GET requesty)
+    if not token and request.query_params.get("token"):
+        token = request.query_params.get("token")
+    
+    # 3. Z JSON body (pro POST requesty)
+    if not token and request.method == "POST":
+        try:
             body = await request.body()
             if body:
                 data = json.loads(body)
-                if data.get('token') == API_MASTER_TOKEN:
-                    return await call_next(request)
-    except:
-        pass
+                token = data.get('token')
+        except:
+            pass
     
-    return JSONResponse(status_code=401, content={"error": "Unauthorized - invalid token"})
+    # Ověř token
+    if token and token == API_MASTER_TOKEN:
+        return await call_next(request)
+    
+    # Pokud token chybí nebo je špatný
+    return JSONResponse(
+        status_code=401, 
+        content={"error": "Unauthorized - invalid token"}
+    )
 
 # ==================== SMTP SLUŽBA ====================
 class SMTPService:
@@ -256,7 +285,7 @@ async def schedule_task(request: TaskRequest):
         task_id = await task_scheduler.schedule_task(optimized_task, request.schedule_time, request.priority)
         
         confirmation = await deepseek_client.execute(
-                        query_instruction=f"Vytvoř přátelské potvrzení naplánování úkolu: {optimized_task} na čas: {request.schedule_time}",
+            query_instruction=f"Vytvoř přátelské potvrzení naplánování úkolu: {optimized_task} na čas: {request.schedule_time}",
             additional_params={"max_tokens": 150}
         )
         
@@ -455,6 +484,42 @@ async def startup_event():
     print("   GET  /api/tasks - List scheduled tasks")
     print("   GET  /api/health - Health check")
     print("   GET  / - API information")
+    print("   GET  /docs - API documentation")
+    print("   GET  /redoc - Alternative documentation")
+
+# ==================== PERFORMANCE OPTIMIZATION ====================
+@app.middleware("http")
+async def add_process_time_header(request: Request, call_next):
+    start_time = datetime.now()
+    response = await call_next(request)
+    process_time = (datetime.now() - start_time).total_seconds()
+    response.headers["X-Process-Time"] = f"{process_time:.3f}s"
+    print(f"⏱️  Request {request.method} {request.url.path} took {process_time:.3f}s")
+    return response
+
+# ==================== RENDER.COM SPECIFIC OPTIMIZATION ====================
+# Pro Render.com free tier - optimalizace pro cold starts
+@app.get("/api/warmup")
+async def warmup():
+    """Endpoint pro zahřátí aplikace na Render.com free tier"""
+    try:
+        # Rychlý test DeepSeek připojení
+        test_response = await deepseek_client.execute(
+            "Hello", 
+            additional_params={"max_tokens": 10, "temperature": 0.1}
+        )
+        return {
+            "success": True,
+            "message": "API warmed up successfully",
+            "deepseek_connected": True,
+            "response_time": datetime.now().isoformat()
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"Warmup failed: {str(e)}",
+            "deepseek_connected": False
+        }
 
 if __name__ == "__main__":
     import uvicorn
